@@ -13,7 +13,6 @@ env:
 jobs:
   build:
     name: Build
-    #runs-on: macos-latest
     runs-on: macos-15
     env:
       JOB_TYPE: BUILD
@@ -49,7 +48,7 @@ jobs:
 
   analyze-clang:
     name: Analyze Clang
-    runs-on: macos-latest
+    runs-on: macos-15
     env:
       JOB_TYPE: ANALYZE
 
