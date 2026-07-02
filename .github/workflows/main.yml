@@ -13,12 +13,13 @@ env:
 jobs:
   build:
     name: Build
-    runs-on: macos-latest
+    #runs-on: macos-latest
+    runs-on: macos-15
     env:
       JOB_TYPE: BUILD
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
         with:
           repository: acidanthera/MacKernelSDK
           path: MacKernelSDK
@@ -33,7 +34,7 @@ jobs:
       - run: xcodebuild -jobs 1 -target Package -configuration Release
 
       - name: Upload to Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: Artifacts
           path: build/*/*/*.zip
@@ -53,9 +54,9 @@ jobs:
       JOB_TYPE: ANALYZE
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: acidanthera/MacKernelSDK
           path: MacKernelSDK
@@ -78,8 +79,8 @@ jobs:
             CLANG_ANALYZER_OUTPUT_DIR="$(pwd)/clang-analyze-debug"
 
       - name: Upload Debug analyzer reports
-        if: always()
-        uses: actions/upload-artifact@v4
+        # i f: always()
+        uses: actions/upload-artifact@v7
         with:
           name: clang-analyze-debug
           path: clang-analyze-debug
@@ -102,7 +103,7 @@ jobs:
 
       - name: Upload Release analyzer reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: clang-analyze-release
           path: clang-analyze-release
@@ -110,52 +111,3 @@ jobs:
       - name: Fail if Release analyzer found issues
         run: |
           [ "$(find clang-analyze-release -name "*.html" 2>/dev/null)" = "" ]
-
-  # analyze-clang:
-  #   name: Analyze Clang
-  #   runs-on: macos-latest
-  #   env:
-  #     JOB_TYPE: ANALYZE
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: actions/checkout@v4
-  #       with:
-  #         repository: acidanthera/MacKernelSDK
-  #         path: MacKernelSDK
-  #     - name: CI Bootstrap
-  #       run: |
-  #         src=$(/usr/bin/curl -Lfs https://raw.githubusercontent.com/acidanthera/ocbuild/master/ci-bootstrap.sh) && eval "$src" || exit 1
-  #     - name: Lilu Bootstrap
-  #       run: |
-  #         src=$(/usr/bin/curl -Lfs https://raw.githubusercontent.com/acidanthera/Lilu/master/Lilu/Scripts/bootstrap.sh) && eval "$src" || exit 1
-
-  #     - run: xcodebuild analyze -quiet -scheme Package -target Package -configuration Debug CLANG_ANALYZER_OUTPUT=plist-html CLANG_ANALYZER_OUTPUT_DIR="$(pwd)/clang-analyze" && [ "$(find clang-analyze -name "*.html")" = "" ]
-  #     - run: xcodebuild clean -quiet -scheme Package
-  #     - run: xcodebuild analyze -quiet -scheme Package -target Package -configuration Release CLANG_ANALYZER_OUTPUT=plist-html CLANG_ANALYZER_OUTPUT_DIR="$(pwd)/clang-analyze" && [ "$(find clang-analyze -name "*.html")" = "" ]
-
-  # analyze-coverity:
-  #   name: Analyze Coverity
-  #   runs-on: macos-latest
-  #   env:
-  #     JOB_TYPE: COVERITY
-  #   if: github.repository_owner == 'acidanthera' && github.event_name != 'pull_request'
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: actions/checkout@v4
-  #       with:
-  #         repository: acidanthera/MacKernelSDK
-  #         path: MacKernelSDK
-  #     - name: CI Bootstrap
-  #       run: |
-  #         src=$(/usr/bin/curl -Lfs https://raw.githubusercontent.com/acidanthera/ocbuild/master/ci-bootstrap.sh) && eval "$src" || exit 1
-  #     - name: Lilu Bootstrap
-  #       run: |
-  #         src=$(/usr/bin/curl -Lfs https://raw.githubusercontent.com/acidanthera/Lilu/master/Lilu/Scripts/bootstrap.sh) && eval "$src" || exit 1
-  #
-  #     - name: Run Coverity
-  #       run: |
-  #         src=$(/usr/bin/curl -Lfs https://raw.githubusercontent.com/acidanthera/ocbuild/master/coverity/covstrap.sh) && eval "$src" || exit 1
-  #       env:
-  #         COVERITY_SCAN_TOKEN: ${{ secrets.COVERITY_SCAN_TOKEN }}
-  #         COVERITY_SCAN_EMAIL: ${{ secrets.COVERITY_SCAN_EMAIL }}
-  #         COVERITY_BUILD_COMMAND: xcodebuild -target Package -configuration Release
