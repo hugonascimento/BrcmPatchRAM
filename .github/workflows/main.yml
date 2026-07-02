@@ -82,7 +82,8 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: clang-analyze-debug
-          path: clang-analyze-debug
+          path: clang-analyze-debug/**/*.html
+          if-no-files-found: ignore
 
       - name: Fail if Debug analyzer found issues
         run: |
@@ -105,7 +106,8 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: clang-analyze-release
-          path: clang-analyze-release
+          path: clang-analyze-release/**/*.html
+          if-no-files-found: ignore
 
       - name: Fail if Release analyzer found issues
         run: |
