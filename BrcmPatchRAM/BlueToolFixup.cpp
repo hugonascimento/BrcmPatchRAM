@@ -12,6 +12,8 @@
 #include <Headers/kern_util.hpp>
 #include <Headers/kern_version.hpp>
 #include <Headers/kern_devinfo.hpp>
+#include <Headers/kern_nvram.hpp>
+#include <Headers/kern_efi.hpp>
 
 
 #define MODULE_SHORT "btlfx"
@@ -161,9 +163,75 @@ static const uint8_t kBadChipsetCheckPatched15_4[] =
     0x90, 0x90
 };
 
+// Optional universal workaround for bluetoothd Read Clock failures.
+// Many third-party Bluetooth controllers (like Intel) fail Apple's HCI_Read_Clock check.
+// When connecting to modern Apple headphones with W1/H1/H2 chips (e.g., AirPods Pro 2),
+// this causes bluetoothd to abort A2DP audio bring-up in the Fast-Connect reconnect path.
+// This results in the infamous "connected but no sound" issue for these devices.
+// See: https://github.com/OpenIntelWireless/IntelBluetoothFirmware/issues/462
+// We patch the Fast-Connect A2DP gate to unconditionally force the success path.
+// Activated by boot-arg -btlfxa2dpcheck
+
+// Apple FastConnect A2DP reconnect gate.
+// Replaces "test r14d, r14d; je" with "xor r14d, r14d; jmp" to
+// unconditionally take the audio-publish path.
+
+// macOS 14.x/15.x/16.x (Sonoma/Sequoia/Tahoe)
+static const uint8_t kFastConnectA2DPGateOriginal14_0[] =
+{
+    0x45, 0x85, 0xF6,
+    0x74, 0x25,
+    0x48, 0x8D, 0x05, 0x00, 0x00, 0x00, 0x00,
+    0x48, 0x8B, 0x18
+};
+
+static const uint8_t kFastConnectA2DPGatePatched14_0[] =
+{
+    0x45, 0x31, 0xF6,
+    0xEB, 0x25,
+    0x48, 0x8D, 0x05, 0x00, 0x00, 0x00, 0x00,
+    0x48, 0x8B, 0x18
+};
+
+static const uint8_t kFastConnectA2DPGateMask14_0[] =
+{
+    0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,
+    0xFF, 0xFF, 0xFF
+};
+
+// macOS 12.x/13.x (Monterey/Ventura)
+static const uint8_t kFastConnectA2DPGateOriginal12_0[] =
+{
+    0x85, 0xDB,
+    0x74, 0x25,
+    0x48, 0x8D, 0x05, 0x00, 0x00, 0x00, 0x00,
+    0x48, 0x8B, 0x18
+};
+
+static const uint8_t kFastConnectA2DPGatePatched12_0[] =
+{
+    0x31, 0xDB,
+    0xEB, 0x25,
+    0x48, 0x8D, 0x05, 0x00, 0x00, 0x00, 0x00,
+    0x48, 0x8B, 0x18
+};
+
+static const uint8_t kFastConnectA2DPGateMask12_0[] =
+{
+    0xFF, 0xFF,
+    0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,
+    0xFF, 0xFF, 0xFF
+};
+
 static bool shouldPatchBoardId = false;
 static bool shouldPatchAddress = false;
 static bool shouldPatchNvramCheck = false;
+static bool shouldPatchA2DPCheck = false;
+static bool loggedA2DPCheckMiss = false;
+static bool shouldPatchChipsetDetection = false;
 
 static constexpr size_t kBoardIdSize = sizeof("Mac-F60DEB81FF30ACF6");
 static constexpr size_t kBoardIdSizeLegacy = sizeof("Mac-F22586C8");
@@ -185,7 +253,128 @@ static const char boardIdsWithUSBBluetooth[][kBoardIdSize] = {
     "Mac-BE088AF8C5EB4FA2"
 };
 
+/**
+ * Patch for the new bluetooth stack since Monterey
+ * bluetoothd was searching for a static USB Product name but most USB Broadcom don't match this one
+ * so we're patching using NVRAM variable (btlfx-product-name)
+ * It isn't the best fix but should work for now
+ */
+static const char kBluetoothUSBHostControllerOriginal[] = "Bluetooth USB Host Controller";
+
+/**
+ * Bypass the Apple proprietary procol which isn't supported on stock BCM cards
+ * which cause bluetoothd to fail due to HCI error
+ */
+static const uint8_t kBypassVSCErrorOriginal[] = {
+    0x80, 0x3D, 0x00, 0x00, 0x00, 0x00, 0x00, // cmp byte ptr [rip+X], 0
+    0x74, 0x00,                             // jz short
+    0x48, 0x8D, 0x35, 0x00, 0x00, 0x00, 0x00, // lea rsi, [rip+string]
+    0x31, 0xFF,                             // xor edi, edi
+    0x5B                                   // pop rbx
+};
+
+static const uint8_t kBypassVSCErrorMask[] = {
+    0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, // cmp
+    0xFF, 0x00,                             // jz
+    0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, // lea
+    0xFF, 0xFF,                             // xor
+    0xFF                                   // pop
+};
+
+static const uint8_t kBypassVSCErrorPatched[] = {
+    0x80, 0x3D, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xEB, 0x00,   // jmp short (offset conservé)
+    0x48, 0x8D, 0x35, 0x00, 0x00, 0x00, 0x00,
+    0x31, 0xFF,
+    0x5B
+};
+
+static const uint8_t kForceFallbackOriginal[] = {
+    0x55,                         // push rbp
+    0x48, 0x89, 0xE5,             // mov rbp, rsp
+    0x41, 0x56,                   // push r14
+    0x53,                         // push rbx
+    0xE8, 0x00, 0x00, 0x00, 0x00, // call sub_1001345D9
+    0x85, 0xC0,                   // test eax, eax
+    0x74, 0x00,                   // jz rel8
+    0xE8, 0x00, 0x00, 0x00, 0x00, // call sub_1001345A7
+    0x84, 0xC0                    // test al, al
+};
+
+
+static const uint8_t kForceFallbackMask[] = {
+    0xFF,                         // push rbp
+    0xFF, 0xFF, 0xFF,             // mov rbp, rsp
+    0xFF, 0xFF,                   // push r14
+    0xFF,                         // push rbx
+    0xFF, 0x00, 0x00, 0x00, 0x00, // call rel32 (wildcard offset)
+    0xFF, 0xFF,                   // test eax, eax
+    0xFF, 0x00,                   // jz opcode exact, offset wildcard
+    0xFF, 0x00, 0x00, 0x00, 0x00, // call rel32 (wildcard)
+    0xFF, 0xFF                    // test al, al
+};
+
+
+static const uint8_t kForceFallbackPatched[] = {
+    0x55,                         // push rbp
+    0x48, 0x89, 0xE5,             // mov rbp, rsp
+    0x41, 0x56,                   // push r14
+    0x53,                         // push rbx
+    0xE8, 0x00, 0x00, 0x00, 0x00, // call sub_1001345D9 (inchangé)
+    0x31, 0xC0,                   // xor eax, eax
+    0xEB, 0x00,                   // jmp rel8 (reprend l’offset du jz)
+    0xE8, 0x00, 0x00, 0x00, 0x00, // call sub_1001345A7 (jamais exécuté)
+    0x84, 0xC0                    // test al, al (jamais exécuté)
+};
+
 static mach_vm_address_t orig_cs_validate {};
+
+
+#pragma mark - Helper functions
+
+// Gathered from https://github.com/acidanthera/RestrictEvents/blob/master/RestrictEvents/RestrictEvents.cpp
+static bool readNvramVariable(const char *fullName, const char16_t *unicodeName, const EFI_GUID *guid, void *dst, size_t max) {
+    // First try the os-provided NVStorage. If it is loaded, it is not safe to call EFI services.
+    NVStorage storage;
+    if (storage.init()) {
+        uint32_t size = 0;
+        auto buf = storage.read(fullName, size, NVStorage::OptRaw);
+        if (buf) {
+            // Do not care if the value is a little bigger.
+            if (size <= max) {
+                memcpy(dst, buf, size);
+            }
+            Buffer::deleter(buf);
+        }
+
+        storage.deinit();
+
+        return buf && size <= max;
+    }
+
+    // Otherwise use EFI services if available.
+    auto rt = EfiRuntimeServices::get(true);
+    if (rt) {
+        uint64_t size = max;
+        uint32_t attr = 0;
+        auto status = rt->getVariable(unicodeName, guid, &attr, &size, dst);
+
+        rt->put();
+        return status == EFI_SUCCESS && size <= max;
+    }
+
+    return false;
+}
+
+void pad_with_null(char *buf, size_t target_size)
+{
+    size_t len = strlen(buf);
+
+    if (len >= target_size)
+        return;
+
+    memset(buf + len, '\0', target_size - len);
+}
 
 #pragma mark - Kernel patching code
 
@@ -206,7 +395,23 @@ static inline void searchAndPatchWithMask(const void *haystack, size_t haystackS
 
 template <size_t findSize, size_t findMaskSize, size_t replaceSize, size_t replaceMaskSize, typename T>
 static inline void searchAndPatchWithMask(const void *haystack, size_t haystackSize, const char *path, const T (&needle)[findSize], const T (&findMask)[findMaskSize], const T (&patch)[replaceSize], const T (&patchMask)[replaceMaskSize]) {
-    searchAndPatchWithMask(haystack, haystackSize, path, needle, findSize * sizeof(T), findMask, findMaskSize * sizeof(T), patch, replaceSize * sizeof(T), patchMask, replaceSize * sizeof(T));
+    searchAndPatchWithMask(haystack, haystackSize, path, needle, findSize * sizeof(T), findMask, findMaskSize * sizeof(T), patch, replaceSize * sizeof(T), patchMask, replaceMaskSize * sizeof(T));
+}
+
+
+
+
+static bool searchAndPatchNamedWithMask(const void *haystack, size_t haystackSize, const char *path, const char *name, const void *needle, size_t findSize, const void *findMask, size_t findMaskSize, const void *patch, size_t replaceSize, const void *patchMask, size_t replaceMaskSize) {
+    if (!KernelPatcher::findAndReplaceWithMask(const_cast<void *>(haystack), haystackSize, needle, findSize, findMask, findMaskSize, patch, replaceSize, patchMask, replaceMaskSize))
+        return false;
+
+    SYSLOG(MODULE_SHORT, "[a2dpcheck] patched %s in %s", name, path);
+    return true;
+}
+
+template <size_t findSize, size_t findMaskSize, size_t replaceSize, size_t replaceMaskSize, typename T>
+static bool searchAndPatchNamedWithMask(const void *haystack, size_t haystackSize, const char *path, const char *name, const T (&needle)[findSize], const T (&findMask)[findMaskSize], const T (&patch)[replaceSize], const T (&patchMask)[replaceMaskSize]) {
+    return searchAndPatchNamedWithMask(haystack, haystackSize, path, name, needle, findSize * sizeof(T), findMask, findMaskSize * sizeof(T), patch, replaceSize * sizeof(T), patchMask, replaceMaskSize * sizeof(T));
 }
 
 
@@ -236,6 +441,38 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
                 searchAndPatch(data, PAGE_SIZE, path, boardIdsWithUSBBluetooth[0], kBoardIdSize, BaseDeviceInfo::get().boardIdentifier, kBoardIdSize);
             if (shouldPatchAddress)
                 searchAndPatchWithMask(data, PAGE_SIZE, path, kSkipAddressCheckOriginal, kSkipAddressCheckMask, kSkipAddressCheckPatched, kSkipAddressCheckMask);
+            if (shouldPatchA2DPCheck) {
+                bool patched = false;
+                
+                // macOS 14.x/15.x/26.x (Sonoma/Sequoia/Tahoe) pattern
+                if (getKernelVersion() >= KernelVersion::Sonoma) {
+                    patched |= searchAndPatchNamedWithMask(data, PAGE_SIZE, path, "fast-connect A2DP BT-clock gate (macOS 14+)", kFastConnectA2DPGateOriginal14_0, kFastConnectA2DPGateMask14_0, kFastConnectA2DPGatePatched14_0, kFastConnectA2DPGateMask14_0);
+                }
+                // macOS 12.x/13.x (Monterey/Ventura) pattern
+                else if (getKernelVersion() >= KernelVersion::Monterey) {
+                    patched |= searchAndPatchNamedWithMask(data, PAGE_SIZE, path, "fast-connect A2DP BT-clock gate (macOS 12/13)", kFastConnectA2DPGateOriginal12_0, kFastConnectA2DPGateMask12_0, kFastConnectA2DPGatePatched12_0, kFastConnectA2DPGateMask12_0);
+                }
+
+                if (!patched && !loggedA2DPCheckMiss) {
+                    loggedA2DPCheckMiss = true;
+                    SYSLOG(MODULE_SHORT, "[a2dpcheck] enabled for bluetoothd, but no known FastConnect Gate pattern was seen yet");
+                }
+            }
+            if (shouldPatchChipsetDetection) {
+                char usbProductName[29];
+                
+                if (readNvramVariable(NVRAM_PREFIX(LILU_VENDOR_GUID, "btlfx-product-name"), u"btlfx-product-name", &EfiRuntimeServices::LiluVendorGuid, usbProductName, sizeof(usbProductName))) {
+                    SYSLOG(MODULE_SHORT, "Patching chipset for new Bluetooth stack");
+                    pad_with_null(usbProductName, sizeof(usbProductName));
+                    searchAndPatch(data, PAGE_SIZE, path, kBluetoothUSBHostControllerOriginal, sizeof(kBluetoothUSBHostControllerOriginal), usbProductName, sizeof(usbProductName));
+                    
+                    searchAndPatchWithMask(data, PAGE_SIZE, path, kBypassVSCErrorOriginal, kBypassVSCErrorMask, kBypassVSCErrorPatched, kBypassVSCErrorMask);
+                    
+                    searchAndPatchWithMask(data, PAGE_SIZE, path, kForceFallbackOriginal, kForceFallbackMask, kForceFallbackPatched, kForceFallbackMask);
+                } else {
+                    SYSLOG(MODULE_SHORT, "Cannot read USB Product Name NVRAM variable. Ignoring patch");
+                }
+            }
         }
     }
 }
@@ -267,6 +504,10 @@ static void pluginStart() {
             shouldPatchAddress = checkKernelArgument("-btlfxallowanyaddr");
         if (getKernelVersion() <= KernelVersion::Sonoma)
             shouldPatchNvramCheck = checkKernelArgument("-btlfxnvramcheck");
+        shouldPatchA2DPCheck = checkKernelArgument("-btlfxa2dpcheck");
+        if (shouldPatchA2DPCheck)
+            SYSLOG(MODULE_SHORT, "[a2dpcheck] bluetoothd Read Clock workaround enabled (fast-connect A2DP bypass)");
+        shouldPatchChipsetDetection = checkKernelArgument("-btlfxchipsetdetection");
         KernelPatcher::RouteRequest csRoute = KernelPatcher::RouteRequest("_cs_validate_page", patched_cs_validate_page, orig_cs_validate);
         if (!patcher.routeMultipleLong(KernelPatcher::KernelID, &csRoute, 1))
             SYSLOG(MODULE_SHORT, "failed to route cs validation pages");
